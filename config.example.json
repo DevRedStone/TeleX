@@ -1,0 +1,6 @@
+{
+    "bot_token": "YOUR_BOT_TOKEN_HERE",
+    "authorized_chat_id": 123456789,
+    "target_channel": "@yourchannel",
+    "channel_tag": "\n@yourchannel"
+}
