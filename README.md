@@ -114,7 +114,7 @@ The bot will start polling for messages. Keep the process running while you want
 Send any X or Twitter URL to your bot in a private chat:
 
 ```
-https://x.com/someuser/status/1234567890
+https://x.com/i/status/1234567890
 ```
 
 ---
