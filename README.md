@@ -1,3 +1,7 @@
+> [!NOTE]
+> **AI-Assisted Project**
+> This bot was written mostly with the help of [Claude](https://claude.ai) (Anthropic) and is a Python interpretation of an original C# implementation.
+
 # X/Twitter → Telegram Forwarder Bot
 
 A personal Telegram bot that forwards tweets from X (Twitter) to a Telegram channel, including text, photos, videos, and quoted tweets. Built with Python and [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot).
