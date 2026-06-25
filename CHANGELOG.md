@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.0] - 2026-06-25
+ 
+### Added
+- **Full reply chain walking.** The bot now follows the reply chain up to 5 levels deep (configurable via `MAX_REPLY_DEPTH`) instead of only fetching the immediate parent. Each ancestor is fetched individually via fxtwitter since the API does not embed parent objects.
+- **Same-author chain merging.** Consecutive tweets in a reply chain that share the same author are merged into a single Telegram message, with texts joined by `---` separators and media concatenated in chronological order. This generalizes the previous pairwise merge to arbitrarily long same-author runs.
+### Fixed
+- **Multi-video media group CDN fallback.** When `sendMediaGroup` fails because Twitter's CDN URLs require auth headers Telegram cannot supply, the bot now downloads every video and thumbnail in the group locally and re-uploads them as file objects. Previously the fallback only sent the primary (first) video, silently discarding the rest.
+- **Video quality selection over-discarding good variants.** Peak bitrate significantly over-estimates actual file size. A 0.4 empirical correction factor is now applied to the size estimate, so short high-bitrate videos that would comfortably fit under Telegram's 50 MB limit are no longer incorrectly downgraded. fxtwitter's own pre-selected top-level URL is also tried first before walking the variant list.
+
+
+---
+
 ## [1.1.0] - 2026-06-08
 
 ### Added
