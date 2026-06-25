@@ -1,5 +1,8 @@
 import json
 import logging
+import os
+import re
+import tempfile
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -31,7 +34,12 @@ AUTHORIZED_CHAT_ID: int = CONFIG["authorized_chat_id"]
 TARGET_CHANNEL: str = CONFIG["target_channel"]
 CHANNEL_TAG: str = CONFIG["channel_tag"]
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
+# Maximum number of ancestor tweets to walk up when resolving a reply chain.
+# Each level requires a separate fxtwitter fetch, so this caps both latency
+# and API load for very long threads.
+MAX_REPLY_DEPTH = 50
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +64,12 @@ def rewrite_to_fxtwitter(url: str) -> str:
 def build_fxtwitter_url(screen_name: str, status_id: str) -> str:
     """Build an api.fxtwitter.com URL from screen name and status ID."""
     return f"https://api.fxtwitter.com/{screen_name}/status/{status_id}"
+
+
+# Matches an x.com / twitter.com status URL anywhere within a larger message,
+# e.g. "check this out https://x.com/user/status/12345 amazing". Captures up
+# to (but not including) any trailing query string, fragment, or punctuation.
+TWEET_URL_RE = re.compile(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/\w+/status/\d+")
 
 
 def parse_video_index_from_message(message_text: str) -> int:
@@ -103,40 +117,61 @@ def extract_photos(media_node: dict) -> list[str]:
 TELEGRAM_MAX_BYTES = 50 * 1024 * 1024  # 50 MB — Telegram bot URL upload limit
 
 
-def best_variant_url(variants: list[dict], duration_seconds: float = 0.0) -> str:
+def best_variant_url(variants: list[dict], duration_seconds: float = 0.0, top_url: str = "") -> str:
     """
-    Pick the highest-bitrate mp4 variant whose estimated file size fits within
-    Telegram's 50 MB bot upload limit.
+    Pick the best video variant URL.
 
-    Estimation: size_bytes ≈ (bitrate_bps / 8) * duration_seconds
-    If duration is unknown (0), skip the size check and just pick the highest bitrate.
-    Falls back through progressively lower qualities until one fits.
-    If nothing fits (or no mp4s), return the lowest-bitrate mp4 as last resort.
+    Strategy:
+    1. If fxtwitter provides a top-level url on the video object (top_url), try
+       it first — it already represents the highest quality fxtwitter chose.
+       Only skip it if its estimated size exceeds the Telegram 50MB limit.
+    2. Otherwise walk variants sorted by bitrate descending, picking the first
+       whose estimated size fits.
+    3. If duration is unknown (0), skip size checks entirely.
+
+    Peak bitrate over-estimates actual file size. We apply a 0.4 correction
+    factor (empirical: actual ≈ peak_estimate * 0.4) to avoid wrongly skipping
+    high-quality variants that would actually fit.
     """
+    CORRECTION = 0.4
+
     mp4 = [v for v in variants if "video/mp4" in v.get("content_type", "") or v.get("url", "").endswith(".mp4")]
     candidates = mp4 if mp4 else variants
-    # Sort highest bitrate first; variants without bitrate sort to bottom
     candidates_sorted = sorted(candidates, key=lambda v: v.get("bitrate", 0), reverse=True)
 
-    if not candidates_sorted:
+    if not candidates_sorted and not top_url:
         return ""
 
     if duration_seconds <= 0:
-        return candidates_sorted[0].get("url", "")
+        result = top_url or (candidates_sorted[0].get("url", "") if candidates_sorted else "")
+        logger.info("best_variant_url: no duration, selecting %s", result[:80])
+        return result
 
+    def fits(bitrate: int) -> bool:
+        return (bitrate / 8) * duration_seconds * CORRECTION <= TELEGRAM_MAX_BYTES
+
+    # Try top_url first (fxtwitter's own highest-quality choice)
+    if top_url:
+        top_bitrate = next((v.get("bitrate", 0) for v in candidates_sorted if v.get("url", "") == top_url), 0)
+        if top_bitrate <= 0 or fits(top_bitrate):
+            logger.info("best_variant_url: selected top_url bitrate=%d url=%s", top_bitrate, top_url[:80])
+            return top_url
+
+    # top_url too large — walk variants from highest to lowest bitrate
     for variant in candidates_sorted:
         bitrate = variant.get("bitrate", 0)
+        url = variant.get("url", "")
         if bitrate <= 0:
-            # No bitrate info — optimistically include it
-            logger.info("best_variant_url: no bitrate, selecting %s", variant.get("url", "")[:80])
-            return variant.get("url", "")
-        estimated_bytes = (bitrate / 8) * duration_seconds
-        if estimated_bytes <= TELEGRAM_MAX_BYTES:
-            logger.info("best_variant_url: selected bitrate=%d est=%.1fMB url=%s", bitrate, estimated_bytes/1024/1024, variant.get("url","")[:80])
-            return variant.get("url", "")
+            logger.info("best_variant_url: no bitrate, selecting %s", url[:80])
+            return url
+        if fits(bitrate):
+            logger.info("best_variant_url: selected bitrate=%d est=%.1fMB url=%s",
+                        bitrate, (bitrate / 8) * duration_seconds * CORRECTION / 1024 / 1024, url[:80])
+            return url
 
-    # Everything exceeds limit — return lowest bitrate as last resort
-    return candidates_sorted[-1].get("url", "")
+    result = candidates_sorted[-1].get("url", "") if candidates_sorted else top_url
+    logger.info("best_variant_url: all exceed limit, using lowest bitrate %s", result[:80])
+    return result
 
 
 def extract_videos(
@@ -164,7 +199,8 @@ def extract_videos(
         if not variants:
             continue
         duration = video.get("duration") or 0.0
-        url = best_variant_url(variants, duration_seconds=duration)
+        top_url = video.get("url", "")
+        url = best_variant_url(variants, duration_seconds=duration, top_url=top_url)
         if not url:
             continue
         thumb = video.get("thumbnail_url", "")
@@ -193,27 +229,11 @@ def extract_videos(
     return video_urls, thumb_urls, primary_video, primary_thumb, primary_is_gif, primary_width, primary_height, primary_duration
 
 
-def build_caption(text: str, author: str, url: str) -> str:
+def build_caption(text: str, author: str, url: str, tag: str = CHANNEL_TAG) -> str:
     """Build a standard MarkdownV2 caption for a tweet."""
     caption = normalize(text)
     caption += f"\n\n[{normalize(author)}]({normalize(url)})"
-    caption += CHANNEL_TAG
-    return caption
-
-
-def build_merged_caption(
-    parent_text: str, parent_author: str, parent_url: str,
-    reply_text: str, reply_url: str,
-) -> str:
-    """
-    Build a single caption merging a parent tweet and its same-author reply.
-    The reply URL is used as the primary attribution link.
-    """
-    caption = normalize(parent_text)
-    caption += "\n\n\\-\\-\\-\n\n"
-    caption += normalize(reply_text)
-    caption += f"\n\n[{normalize(parent_author)}]({normalize(reply_url)})"
-    caption += CHANNEL_TAG
+    caption += tag
     return caption
 
 
@@ -273,7 +293,6 @@ async def download_video(url: str) -> str | None:
     Twitter CDN URLs require a proper User-Agent and may not be directly
     fetchable by Telegram's servers, so we download and re-upload.
     """
-    import tempfile, os
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://x.com/",
@@ -297,9 +316,8 @@ async def send_video_with_fallback(bot, url: str, is_gif: bool, thumb_url: str, 
                                    width: int = 0, height: int = 0, duration: int = 0, **kwargs):
     """
     Try sending video by URL first. If Telegram rejects it, download locally
-    and re-upload as a file. Cleans up the temp file afterward.
+    and re-upload as a file. Cleans up the temp file afterwards.
     """
-    import os
 
     async def _send(video_src, write_timeout: int = 20, thumb_override=None):
         if is_gif:
@@ -444,21 +462,57 @@ async def send_tweet_content(
             messages = await bot.send_media_group(media=media_group, **kwargs)
             return messages[0] if messages else None
         except Exception as e:
-            logger.error("send_media_group failed: %s", e)
-            # Fallback: send primary item via download-if-needed helper
-            if primary_video_url:
-                return await send_video_with_fallback(
-                    bot=bot,
-                    url=primary_video_url,
-                    is_gif=primary_is_gif,
-                    thumb_url=primary_thumb_url,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    width=primary_width,
-                    height=primary_height,
-                    duration=primary_duration,
-                    **kwargs,
-                )
+            logger.error("send_media_group failed with URLs (%s), retrying with local downloads", e)
+            # The CDN URLs require auth headers Telegram can't send — download
+            # every item locally and rebuild the group with file objects.
+            tmp_files: list[tuple[str, object]] = []  # (path, file_handle)
+            try:
+                dl_photo_srcs = []
+                for url in photo_urls:
+                    tmp = await download_video(url)
+                    if tmp:
+                        fh = open(tmp, "rb")
+                        tmp_files.append((tmp, fh))
+                        dl_photo_srcs.append(fh)
+                    else:
+                        dl_photo_srcs.append(url)  # best-effort fallback
+
+                dl_video_srcs = []
+                dl_thumb_srcs = []
+                for i, url in enumerate(video_urls):
+                    tmp = await download_video(url)
+                    if tmp:
+                        fh = open(tmp, "rb")
+                        tmp_files.append((tmp, fh))
+                        dl_video_srcs.append(fh)
+                    else:
+                        dl_video_srcs.append(url)
+                    thumb = thumb_urls[i] if i < len(thumb_urls) else None
+                    if thumb:
+                        tmp_t = await download_video(thumb)
+                        if tmp_t:
+                            fh_t = open(tmp_t, "rb")
+                            tmp_files.append((tmp_t, fh_t))
+                            dl_thumb_srcs.append(fh_t)
+                        else:
+                            dl_thumb_srcs.append(thumb)
+                    else:
+                        dl_thumb_srcs.append(None)
+
+                dl_group = build_media_group(dl_photo_srcs, dl_video_srcs, dl_thumb_srcs, caption)
+                if dl_group:
+                    messages = await bot.send_media_group(media=dl_group, write_timeout=120, **kwargs)
+                    return messages[0] if messages else None
+            finally:
+                for path, fh in tmp_files:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
     return None
 
 
@@ -470,24 +524,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message = update.message
     if message is None:
         return
-    if message.chat.id != AUTHORIZED_CHAT_ID:
-        return
     if message.text is None:
         return
 
     message_text: str = message.text
+    chat = message.chat
 
-    # Strip the ::N suffix and all &flag qualifiers before URL validation
-    base_url = message_text.split("::")[0].split("&")[0]
+    # -------------------------------------------------------------------
+    # Two entry modes:
+    #
+    #   1. Authorized private chat (existing behavior): the message must
+    #      itself BE the tweet URL (optionally with ::N / &nq / &nr flags).
+    #      Output is posted to TARGET_CHANNEL with CHANNEL_TAG appended.
+    #
+    #   2. Any group/supergroup the bot is a member of: a tweet URL may
+    #      appear ANYWHERE in the message text. No flags are parsed (full
+    #      chain, no skip-quote/skip-reply, default video). Output is
+    #      posted back into the SAME chat, as a reply to the triggering
+    #      message, with no channel tag.
+    #
+    # Any other chat (random private DMs, channel posts, etc.) is ignored.
+    # -------------------------------------------------------------------
+    if chat.id == AUTHORIZED_CHAT_ID:
+        # Strip the ::N suffix and all &flag qualifiers before URL validation
+        base_url = message_text.split("::")[0].split("&")[0]
+        if not (base_url.startswith("https://x.com/") or base_url.startswith("https://twitter.com/")):
+            return
 
-    if not (base_url.startswith("https://x.com/") or base_url.startswith("https://twitter.com/")):
+        skip_quote = should_skip_quote(message_text)
+        skip_reply = should_skip_reply(message_text)
+        selected_video_index = parse_video_index_from_message(message_text)
+        dest_chat_id = TARGET_CHANNEL
+        tag = CHANNEL_TAG
+        pending_reply_to_id: int | None = None
+
+    elif chat.type in ("group", "supergroup"):
+        match = TWEET_URL_RE.search(message_text)
+        if not match:
+            return
+        base_url = match.group(0)
+
+        skip_quote = False
+        skip_reply = False
+        selected_video_index = 0
+        dest_chat_id = chat.id
+        tag = ""
+        pending_reply_to_id = message.message_id
+
+    else:
         return
 
-    logger.info("Received URL: %s in chat %d", message_text, message.chat.id)
-
-    skip_quote = should_skip_quote(message_text)
-    skip_reply = should_skip_reply(message_text)
-    selected_video_index = parse_video_index_from_message(message_text)
+    logger.info("Received URL: %s in chat %d", base_url, chat.id)
     link_preview_options = LinkPreviewOptions(is_disabled=True)
 
     # --- Fetch main tweet ---
@@ -512,63 +599,101 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         extract_videos(tweet_media, selected_video_index) if tweet_media.get("videos") else ([], [], "", "", False, 0, 0, 0)
     )
 
-    # --- Fetch reply-parent tweet (if this tweet is a reply) ---
+    # --- Walk up the full reply chain (if this tweet is a reply) ---
     #
     # fxtwitter exposes `replying_to` (screen_name) and `replying_to_status`
-    # (tweet ID) but does NOT embed the full parent object, so we fetch it
-    # separately.  Two cases:
-    #   1. Same author → merge into one combined message (no threading needed).
-    #   2. Different author → send parent first, then send main tweet as a reply.
+    # (tweet ID) on every tweet but does NOT embed the parent object, so each
+    # ancestor must be fetched individually. We walk up to MAX_REPLY_DEPTH
+    # levels, stopping early if a tweet has no parent or a fetch fails.
     #
-    reply_parent: dict | None = None
-    same_author_reply = False
+    # ancestors_near_to_far[0] is the immediate parent of the main tweet,
+    # ancestors_near_to_far[1] is its parent, etc.
+    ancestors_near_to_far: list[dict] = []
+    if not skip_reply:
+        cur = tweet
+        for depth in range(MAX_REPLY_DEPTH):
+            rname = cur.get("replying_to")
+            rid = cur.get("replying_to_status")
+            if not (rname and rid):
+                break
+            parent_fx_url = build_fxtwitter_url(rname, rid)
+            logger.info("Fetching reply ancestor (depth %d): %s", depth + 1, parent_fx_url)
+            parent = fetch_tweet(parent_fx_url)
+            if not parent:
+                break
+            ancestors_near_to_far.append(parent)
+            cur = parent
 
-    replying_to_name = tweet.get("replying_to")      # screen_name or None
-    replying_to_id   = tweet.get("replying_to_status")  # snowflake str or None
+    # Oldest first, ending with the immediate parent of the main tweet.
+    chain_old_to_new = list(reversed(ancestors_near_to_far))
 
-    if replying_to_name and replying_to_id and not skip_reply:
-        parent_fx_url = build_fxtwitter_url(replying_to_name, replying_to_id)
-        logger.info("Fetching reply-parent: %s", parent_fx_url)
-        reply_parent = fetch_tweet(parent_fx_url)
-        if reply_parent:
-            parent_author = reply_parent.get("author", {}).get("screen_name", "")
-            same_author_reply = (
-                parent_author.lower() == tweet_author.lower()
+    # Group consecutive same-author tweets so they render as one merged message.
+    groups: list[list[dict]] = []
+    for t in chain_old_to_new:
+        author = (t.get("author", {}).get("screen_name", "") or "").lower()
+        if groups and (groups[-1][0].get("author", {}).get("screen_name", "") or "").lower() == author:
+            groups[-1].append(t)
+        else:
+            groups.append([t])
+
+    # Does the main tweet merge into the last ancestor group (same author)?
+    same_author_reply = bool(groups) and (
+        (groups[-1][0].get("author", {}).get("screen_name", "") or "").lower() == tweet_author.lower()
+    )
+    merge_group: list[dict] | None = groups.pop() if same_author_reply else None
+
+    # -----------------------------------------------------------------------
+    # Sending model
+    #
+    #   1. Each remaining ancestor group is sent oldest-first, standalone for
+    #      the first group, then each subsequent group replies to the
+    #      previously sent group's message.
+    #   2. The first group, if it is a single tweet that itself quotes
+    #      something, has that quoted tweet sent first (standalone) and the
+    #      group quote-replies to it — this preserves the original
+    #      "quoted → quoting tweet → ..." ordering for threads that start
+    #      with a quote-tweet.
+    #   3. If the main tweet shares its author with the last ancestor in the
+    #      chain (merge_group), they are merged into a single message instead
+    #      of being sent separately.
+    #   4. If the main tweet itself has a quote (tweet["quote"]), that is sent
+    #      standalone and the main tweet quote-replies to it, taking priority
+    #      as the anchor only if no ancestor chain anchor already exists.
+    #
+    #   Telegram's ReplyParameters can only target ONE other message at a
+    #   time, so quote-highlighting on intermediate (non-first, non-last)
+    #   groups is intentionally skipped — those groups simply reply to the
+    #   previous group's message without a quote highlight.
+    # -----------------------------------------------------------------------
+
+    def _resolve_reply_params(reply_to_msg=None, quote_text: str = ""):
+        """
+        Build ReplyParameters for a message about to be sent.
+
+        - If reply_to_msg is given (optionally with quote_text), reply/quote
+          that message as before.
+        - Otherwise, if this is the very first message of the whole response
+          AND we're in group mode (pending_reply_to_id is set), reply to the
+          user's triggering message instead — so the bot's response appears
+          threaded under their link in the group.
+        - pending_reply_to_id is consumed on first use; only the first
+          message of the response ever replies to the source message.
+        """
+        nonlocal pending_reply_to_id
+        if reply_to_msg and quote_text:
+            rp = ReplyParameters(
+                message_id=reply_to_msg.message_id,
+                quote=quote_text,
+                quote_parse_mode=ParseMode.MARKDOWN_V2,
             )
-
-    # -----------------------------------------------------------------------
-    # Determine send order and build each piece.
-    #
-    # There are two independent dimensions:
-    #   A) Does the main tweet have a quote?      → quote lives on tweet["quote"]
-    #   B) Is the main tweet a reply?             → reply_parent is set
-    #      B1) reply-parent is itself a quote-tweet → reply_parent["quote"] exists
-    #
-    # The correct channel sequence for every combination:
-    #
-    #   A only (main tweet is a quote-tweet, not a reply):
-    #     1. quoted tweet  (standalone)
-    #     2. main tweet    (replies to #1)
-    #
-    #   B only (main tweet is a reply, reply-parent has no quote):
-    #     1. reply-parent  (standalone)
-    #     2. main tweet    (replies to #1)
-    #
-    #   B1 (main tweet is a reply, reply-parent is itself a quote-tweet):
-    #     1. quoted tweet  (standalone — the thing reply-parent quoted)
-    #     2. reply-parent  (replies to #1)
-    #     3. main tweet    (replies to #2)
-    #
-    #   A + B (main tweet both replies AND quotes — unusual but possible):
-    #     1. reply-parent  (standalone)
-    #     2. quoted tweet  (standalone)
-    #     3. main tweet    (replies to #1, with quote highlight of #2)
-    #     → treat as two independent threads; simpler and avoids ambiguity.
-    #
-    # Key rule: the quote is ALWAYS standalone (no reply_parameters).
-    #           The reply-parent replies to the quote only in the B1 case.
-    #           The main tweet always replies to the message sent just before it.
-    # -----------------------------------------------------------------------
+        elif reply_to_msg:
+            rp = ReplyParameters(message_id=reply_to_msg.message_id)
+        elif pending_reply_to_id is not None:
+            rp = ReplyParameters(message_id=pending_reply_to_id)
+        else:
+            rp = None
+        pending_reply_to_id = None
+        return rp
 
     async def send_quote_tweet(quote: dict, reply_to_msg=None):
         """Send a quoted tweet as standalone (or optionally replying to reply_to_msg)."""
@@ -577,17 +702,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         q_author = quote.get("author", {}).get("screen_name", "")
         q_caption = normalize(q_text)
         q_caption += f"\n\n[{normalize(q_author)}]({normalize(q_url)})"
-        q_caption += CHANNEL_TAG
+        q_caption += tag
 
         q_media = quote.get("media") or {}
         q_photos = extract_photos(q_media)
         q_videos, q_thumbs, q_primary_video, q_primary_thumb, q_primary_is_gif, q_primary_width, q_primary_height, q_primary_duration = (
             extract_videos(q_media, selected_video_index) if q_media.get("videos") else ([], [], "", "", False, 0, 0, 0)
         )
-        rp = ReplyParameters(message_id=reply_to_msg.message_id) if reply_to_msg else None
+        rp = _resolve_reply_params(reply_to_msg)
         return await send_tweet_content(
             bot=context.bot,
-            chat_id=TARGET_CHANNEL,
+            chat_id=dest_chat_id,
             caption=q_caption,
             photo_urls=q_photos,
             video_urls=q_videos,
@@ -602,136 +727,139 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             link_preview_options=link_preview_options,
         )
 
-    async def send_reply_parent(parent: dict, reply_to_msg=None, quote_text: str = ""):
-        """Send the reply-parent tweet.
-        If reply_to_msg + quote_text are given, quotes that message (Telegram quote-reply).
-        If only reply_to_msg is given, plain-replies.
+    def merge_tweets(tweets: list[dict]) -> tuple[str, list[str], list[str], list[str], str, str, bool, int, int, int]:
         """
-        p_url    = parent.get("url", "")
-        p_text   = parent.get("text", "")
-        p_author = parent.get("author", {}).get("screen_name", "")
-        if parent.get("replying_to"):
-            p_text = strip_reply_mentions(p_text)
-        p_caption = build_caption(p_text, p_author, p_url)
+        Merge one or more same-author tweets into a single caption + media set.
+        Returns (caption, photo_urls, video_urls, thumb_urls, primary_video_url,
+                 primary_thumb_url, primary_is_gif, primary_width, primary_height,
+                 primary_duration).
+        Media is concatenated in chronological order; the LAST tweet that has a
+        video provides the primary_* values (so a media group's caption-bearing
+        item lines up with the most recent tweet's video when present).
+        """
+        last = tweets[-1]
+        last_url = last.get("url", "")
+        last_author = last.get("author", {}).get("screen_name", "")
 
-        p_media = parent.get("media") or {}
-        p_photos = extract_photos(p_media)
-        p_videos, p_thumbs, p_primary_video, p_primary_thumb, p_primary_is_gif, p_primary_width, p_primary_height, p_primary_duration = (
-            extract_videos(p_media, selected_video_index) if p_media.get("videos") else ([], [], "", "", False, 0, 0, 0)
-        )
-        if reply_to_msg and quote_text:
-            rp = ReplyParameters(
-                message_id=reply_to_msg.message_id,
-                quote=quote_text,
-                quote_parse_mode=ParseMode.MARKDOWN_V2,
-            )
-        elif reply_to_msg:
-            rp = ReplyParameters(message_id=reply_to_msg.message_id)
+        texts = []
+        for t in tweets:
+            txt = t.get("text", "")
+            if t.get("replying_to"):
+                txt = strip_reply_mentions(txt)
+            texts.append(normalize(txt))
+
+        if len(texts) == 1:
+            caption = texts[0]
         else:
-            rp = None
+            caption = "\n\n\\-\\-\\-\n\n".join(texts)
+        caption += f"\n\n[{normalize(last_author)}]({normalize(last_url)})"
+        caption += tag
+
+        all_photos: list[str] = []
+        all_videos: list[str] = []
+        all_thumbs: list[str] = []
+        primary_video, primary_thumb, primary_is_gif = "", "", False
+        primary_width, primary_height, primary_duration = 0, 0, 0
+
+        for t in tweets:
+            media = t.get("media") or {}
+            photos = extract_photos(media)
+            if media.get("videos"):
+                videos, thumbs, p_video, p_thumb, p_gif, p_w, p_h, p_dur = extract_videos(media, selected_video_index)
+            else:
+                videos, thumbs, p_video, p_thumb, p_gif, p_w, p_h, p_dur = [], [], "", "", False, 0, 0, 0
+            all_photos += photos
+            all_videos += videos
+            all_thumbs += thumbs
+            if p_video:
+                primary_video, primary_thumb, primary_is_gif = p_video, p_thumb, p_gif
+                primary_width, primary_height, primary_duration = p_w, p_h, p_dur
+
+        return caption, all_photos, all_videos, all_thumbs, primary_video, primary_thumb, primary_is_gif, primary_width, primary_height, primary_duration
+
+    async def send_unit(tweets: list[dict], reply_to_msg=None, quote_text: str = ""):
+        """Send one or more same-author tweets merged into a single message."""
+        caption, photos, videos, thumbs, p_video, p_thumb, p_gif, p_w, p_h, p_dur = merge_tweets(tweets)
+
+        rp = _resolve_reply_params(reply_to_msg, quote_text)
+
         return await send_tweet_content(
             bot=context.bot,
-            chat_id=TARGET_CHANNEL,
-            caption=p_caption,
-            photo_urls=p_photos,
-            video_urls=p_videos,
-            thumb_urls=p_thumbs,
-            primary_video_url=p_primary_video,
-            primary_thumb_url=p_primary_thumb,
-            primary_is_gif=p_primary_is_gif,
-            primary_width=p_primary_width,
-            primary_height=p_primary_height,
-            primary_duration=p_primary_duration,
+            chat_id=dest_chat_id,
+            caption=caption,
+            photo_urls=photos,
+            video_urls=videos,
+            thumb_urls=thumbs,
+            primary_video_url=p_video,
+            primary_thumb_url=p_thumb,
+            primary_is_gif=p_gif,
+            primary_width=p_w,
+            primary_height=p_h,
+            primary_duration=p_dur,
             reply_parameters=rp,
             link_preview_options=link_preview_options,
         )
 
     main_tweet_quote = tweet.get("quote")
-    parent_quote     = reply_parent.get("quote") if reply_parent else None
 
     # Message that the main tweet should reply to in the channel
     anchor_message = None
     # For the main tweet's quote highlight (only used when main tweet itself quotes)
     quote_highlight: str = ""
 
-    # --- Case B1: reply whose parent is itself a quote-tweet ---
-    # The quoted tweet is sent first (standalone), then the reply-parent is sent
-    # quoting it (Telegram quote-reply), then the main tweet replies to the parent.
-    if reply_parent and not same_author_reply and parent_quote and not skip_quote:
-        try:
-            q_msg = await send_quote_tweet(parent_quote)
-        except Exception as e:
-            logger.error("Failed to send parent's quote: %s", e)
-            q_msg = None
-        # Pass quote_text so the reply-parent quotes the quoted tweet rather
-        # than plain-replying to it.
-        pq_highlight = normalize(parent_quote.get("text", "")) if q_msg else ""
-        try:
-            anchor_message = await send_reply_parent(
-                reply_parent, reply_to_msg=q_msg, quote_text=pq_highlight
-            )
-        except Exception as e:
-            logger.error("Failed to send reply-parent: %s", e)
+    # --- Send ancestor chain groups, oldest first ---
+    for i, group in enumerate(groups):
+        group_quote = group[0].get("quote") if len(group) == 1 else None
+        # Only the FIRST group can be quote-anchored: ReplyParameters can only
+        # target one message, and non-first groups already need reply_to_msg
+        # pointing at the previous group.
+        if i == 0 and group_quote and not skip_quote and anchor_message is None:
+            try:
+                gq_msg = await send_quote_tweet(group_quote)
+            except Exception as e:
+                logger.error("Failed to send chain-start quote: %s", e)
+                gq_msg = None
+            gq_highlight = normalize(group_quote.get("text", "")) if gq_msg else ""
+            try:
+                anchor_message = await send_unit(group, reply_to_msg=gq_msg, quote_text=gq_highlight)
+            except Exception as e:
+                logger.error("Failed to send reply-chain ancestor: %s", e)
+        else:
+            try:
+                anchor_message = await send_unit(group, reply_to_msg=anchor_message)
+            except Exception as e:
+                logger.error("Failed to send reply-chain ancestor: %s", e)
 
-    # --- Case B only: reply whose parent has no quote ---
-    elif reply_parent and not same_author_reply:
-        try:
-            anchor_message = await send_reply_parent(reply_parent)
-        except Exception as e:
-            logger.error("Failed to send reply-parent: %s", e)
-
-    # --- Case A (possibly combined with B, handled independently): main tweet quotes ---
+    # --- Main tweet's own quote ---
     if main_tweet_quote and not skip_quote:
         quote_highlight = normalize(main_tweet_quote.get("text", ""))
         try:
             q_msg = await send_quote_tweet(main_tweet_quote)
-            # In A-only (no reply), main tweet replies to the quote message.
-            # In A+B, main tweet replies to the reply-parent (anchor_message),
-            # so we only set anchor here when there's no reply-parent thread.
+            # If an ancestor chain already produced an anchor, the main tweet
+            # replies to that instead; only use the quote as anchor when there
+            # is no reply chain.
             if anchor_message is None:
                 anchor_message = q_msg
         except Exception as e:
             logger.error("Failed to send quote: %s", e)
 
     # --- Build ReplyParameters for the main tweet ---
-    main_reply_parameters = None
-    if anchor_message is not None:
-        main_reply_parameters = ReplyParameters(
-            message_id=anchor_message.message_id,
-            quote=quote_highlight if quote_highlight and main_tweet_quote else None,
-            quote_parse_mode=ParseMode.MARKDOWN_V2 if quote_highlight and main_tweet_quote else None,
-        )
+    # _resolve_reply_params also handles the group-mode fallback: if no
+    # ancestor chain or quote was sent before this (anchor_message is None),
+    # and we're in group mode, this becomes the first message and replies to
+    # the user's triggering message instead.
+    main_reply_parameters = _resolve_reply_params(
+        anchor_message,
+        quote_highlight if (quote_highlight and main_tweet_quote) else "",
+    )
 
-    # --- Step 4: build caption for the main tweet ---
-    # Same-author reply: merge parent text above a separator
-    if reply_parent and same_author_reply:
-        parent_text   = reply_parent.get("text", "")
-        parent_author = reply_parent.get("author", {}).get("screen_name", "")
-        main_caption = build_merged_caption(
-            parent_text=parent_text,
-            parent_author=parent_author,
-            parent_url=tweet_url,  # link points to the reply (the latest tweet)
-            reply_text=tweet_text,
-            reply_url=tweet_url,
+    # --- Step 4: build caption + media for the main tweet ---
+    if merge_group:
+        main_caption, merged_photo_urls, merged_video_urls, merged_thumb_urls, merged_primary_video, merged_primary_thumb, merged_primary_is_gif, merged_primary_width, merged_primary_height, merged_primary_duration = merge_tweets(
+            merge_group + [tweet]
         )
-        # Also merge media: parent photos/videos first, then reply photos/videos
-        parent_media = reply_parent.get("media") or {}
-        parent_photo_urls = extract_photos(parent_media)
-        parent_video_urls, parent_thumb_urls, parent_primary_video, parent_primary_thumb, parent_primary_is_gif, parent_primary_width, parent_primary_height, parent_primary_duration = (
-            extract_videos(parent_media, selected_video_index) if parent_media.get("videos") else ([], [], "", "", False, 0, 0, 0)
-        )
-        merged_photo_urls = parent_photo_urls + tweet_photo_urls
-        merged_video_urls = parent_video_urls + tweet_video_urls
-        merged_thumb_urls = parent_thumb_urls + tweet_thumb_urls
-        # Primary video: prefer the reply's, fall back to parent's
-        merged_primary_video = tweet_primary_video or parent_primary_video
-        merged_primary_thumb = tweet_primary_thumb or parent_primary_thumb
-        merged_primary_is_gif = tweet_primary_is_gif if tweet_primary_video else parent_primary_is_gif
-        merged_primary_width = tweet_primary_width if tweet_primary_video else parent_primary_width
-        merged_primary_height = tweet_primary_height if tweet_primary_video else parent_primary_height
-        merged_primary_duration = tweet_primary_duration if tweet_primary_video else parent_primary_duration
     else:
-        main_caption = build_caption(tweet_text, tweet_author, tweet_url)
+        main_caption = build_caption(tweet_text, tweet_author, tweet_url, tag=tag)
         merged_photo_urls = tweet_photo_urls
         merged_video_urls = tweet_video_urls
         merged_thumb_urls = tweet_thumb_urls
@@ -746,7 +874,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         await send_tweet_content(
             bot=context.bot,
-            chat_id=TARGET_CHANNEL,
+            chat_id=dest_chat_id,
             caption=main_caption,
             photo_urls=merged_photo_urls,
             video_urls=merged_video_urls,
